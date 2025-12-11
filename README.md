@@ -1,0 +1,2 @@
+# Duckov_PersistentPotionBuff
+逃离鸭科夫_常驻药剂buff
