@@ -83,12 +83,13 @@ namespace PersistentPotionBuff
         private void InitializeBuffMap()
         {
             _itemIdToBuffNameMap.Clear();
+            // 默认组合
             _itemIdToBuffNameMap[0] = "1201_Buff_NightVision";
             _itemIdToBuffNameMap[137] = "1011_Buff_AddSpeed";
             _itemIdToBuffNameMap[398] = "1012_Buff_InjectorMaxWeight";
             _itemIdToBuffNameMap[408] = "1072_Buff_ElecResistShort";
             _itemIdToBuffNameMap[409] = "1084_Buff_PainResistLong";
-            _itemIdToBuffNameMap[438] = "1092_Buff_Injector_HotBlood_Trigger";
+            _itemIdToBuffNameMap[438] = "1092_Buff_Injector_HotBlood_Trigger"; // V3.6 修复: 使用 Trigger 版本
             _itemIdToBuffNameMap[797] = "1013_Buff_InjectorArmor";
             _itemIdToBuffNameMap[798] = "1014_Buff_InjectorStamina";
             _itemIdToBuffNameMap[800] = "1015_Buff_InjectorMeleeDamage";
@@ -99,6 +100,68 @@ namespace PersistentPotionBuff
             _itemIdToBuffNameMap[1071] = "1075_Buff_PoisonResistShort";
             _itemIdToBuffNameMap[1072] = "1076_Buff_SpaceResistShort";
             _itemIdToBuffNameMap[1247] = "1019_buff_Injector_BleedResist";
+            // 自定义配置
+            LoadCustomIniConfig();
+        }
+
+        private string GetConfigPath()
+        {
+            return System.IO.Path.Combine(System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "config.ini");
+        }
+
+        // 读取INI配置（物品ID=Buff名称）
+        private void LoadCustomIniConfig()
+        {
+            string path = GetConfigPath();
+            if (!System.IO.File.Exists(path)) return;
+            bool overrideDefault = false;
+            var customMap = new Dictionary<int, string>();
+            try
+            {
+                var lines = System.IO.File.ReadAllLines(path);
+                foreach (var raw in lines)
+                {
+                    var line = raw.Trim();
+                    if (string.IsNullOrEmpty(line) || line.StartsWith("#")) continue;
+                    if (line.StartsWith("overrideDefault", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = line.Split('=');
+                        if (parts.Length == 2 && parts[1].Trim().ToLower() == "true")
+                            overrideDefault = true;
+                        continue;
+                    }
+                    if (line.StartsWith("DebugMode", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = line.Split('=');
+                        if (parts.Length == 2 && parts[1].Trim().ToLower() == "true")
+                            DebugMode = true;
+                        else
+                            DebugMode = false;
+                        continue;
+                    }
+                    var kv = line.Split('=');
+                    if (kv.Length == 2)
+                    {
+                        int itemId;
+                        string buffName = kv[1].Trim();
+                        if (int.TryParse(kv[0].Trim(), out itemId) && !string.IsNullOrEmpty(buffName))
+                        {
+                            customMap[itemId] = buffName;
+                        }
+                    }
+                }
+                if (customMap.Count > 0)
+                {
+                    if (overrideDefault)
+                        _itemIdToBuffNameMap.Clear();
+                    foreach (var kv in customMap)
+                        _itemIdToBuffNameMap[kv.Key] = kv.Value;
+                }
+            }
+            catch (Exception e)
+            {
+                // 解析失败
+            }
         }
 
         private void CacheBuffs()
