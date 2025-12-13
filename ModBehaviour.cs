@@ -36,6 +36,7 @@ namespace PersistentPotionBuff
         public int targetContainerId = 882;
         public int requiredItemCount = 3;
         public bool enableInBaseLevel = false;
+        public List<string> additionalSlots = new List<string> { "Medic" };
     }
 
     public class ModBehaviour : Duckov.Modding.ModBehaviour
@@ -52,6 +53,9 @@ namespace PersistentPotionBuff
         private HashSet<Inventory> subscribedInventories = new HashSet<Inventory>();
         // 追踪的容器列表
         private HashSet<Item> trackedContainers = new HashSet<Item>();
+
+        // 追踪的额外槽位 (SlotName -> SlotObj)
+        private Dictionary<string, ItemStatsSystem.Items.Slot> _trackedSlots = new Dictionary<string, ItemStatsSystem.Items.Slot>();
 
         // Debug模式
         public static bool DebugMode = false;
@@ -90,6 +94,16 @@ namespace PersistentPotionBuff
             LevelManager.OnLevelInitialized -= OnLevelInitialized;
             CharacterMainControl.OnMainCharacterInventoryChangedEvent -= OnMainCharacterInventoryChanged;
             SceneManager.sceneLoaded -= OnSceneLoaded;
+
+            // 取消额外槽位事件订阅
+            foreach (var kvp in _trackedSlots)
+            {
+                if (kvp.Value != null)
+                {
+                    try { kvp.Value.onSlotContentChanged -= OnTrackedSlotChanged; } catch {}
+                }
+            }
+            _trackedSlots.Clear();
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
@@ -107,6 +121,16 @@ namespace PersistentPotionBuff
             }
             subscribedInventories.Clear();
             trackedContainers.Clear();
+
+            // 解除额外槽位订阅
+            foreach (var kvp in _trackedSlots)
+            {
+                if (kvp.Value != null)
+                {
+                    try { kvp.Value.onSlotContentChanged -= OnTrackedSlotChanged; } catch {}
+                }
+            }
+            _trackedSlots.Clear();
         }
 
         private void InitializeBuffMap()
@@ -309,6 +333,7 @@ namespace PersistentPotionBuff
 
             StartCoroutine(InitialCheckRoutine());
             StartCoroutine(WaitForPetInventoryAndResubscribe());
+            StartCoroutine(WaitForSlotsAndSubscribe());
         }
 
         private IEnumerator InitialCheckRoutine()
@@ -346,6 +371,82 @@ namespace PersistentPotionBuff
             // 玩家背包事件
             CharacterMainControl.OnMainCharacterInventoryChangedEvent -= OnMainCharacterInventoryChanged;
             CharacterMainControl.OnMainCharacterInventoryChangedEvent += OnMainCharacterInventoryChanged;
+            // 订阅额外槽位变化
+            yield return WaitForSlotsAndSubscribe();
+        }
+
+        // 等待并订阅额外槽位变化
+        private IEnumerator WaitForSlotsAndSubscribe()
+        {
+            int guard = 0;
+            while ((CharacterMainControl.Main == null || CharacterMainControl.Main.CharacterItem == null || CharacterMainControl.Main.CharacterItem.Slots == null) && guard < 600)
+            {
+                guard++;
+                yield return null;
+            }
+
+            if (_settings.additionalSlots == null) yield break;
+
+            foreach (var slotName in _settings.additionalSlots)
+            {
+                var slot = GetSlotByName(slotName);
+                if (slot != null)
+                {
+                    // 如果之前已经订阅过，先取消
+                    if (_trackedSlots.TryGetValue(slotName, out var oldSlot) && oldSlot != null)
+                    {
+                        try { oldSlot.onSlotContentChanged -= OnTrackedSlotChanged; } catch {}
+                    }
+
+                    _trackedSlots[slotName] = slot;
+                    try 
+                    { 
+                        slot.onSlotContentChanged += OnTrackedSlotChanged; 
+                        Log($"已订阅槽位变化事件: {slotName}"); 
+                    } 
+                    catch {}
+                }
+            }
+
+            // 做一次扫描与更新
+            UpdateTrackedContainers();
+            yield return new WaitForEndOfFrame();
+            UpdateBuffs();
+        }
+
+        // 额外槽位内容变化事件
+        private void OnTrackedSlotChanged(ItemStatsSystem.Items.Slot slot)
+        {
+            Log($"追踪槽位变化，内容:{(slot?.Content != null ? slot.Content.TypeID.ToString() : "空")}");
+            StartCoroutine(DeferredUpdate(rescan: true));
+        }
+
+        // 根据名称获取玩家的槽位
+        private ItemStatsSystem.Items.Slot GetSlotByName(string slotName)
+        {
+            try
+            {
+                var main = CharacterMainControl.Main;
+                if (main == null || main.CharacterItem == null) return null;
+                var slots = main.CharacterItem.Slots;
+                if (slots == null) return null;
+                
+                ItemStatsSystem.Items.Slot slot = null;
+                try { slot = slots[slotName]; } catch { slot = null; }
+                
+                if (slot == null)
+                {
+                    foreach (var s in slots)
+                    {
+                        if (s != null && string.Equals(s.Key, slotName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            slot = s; break;
+                        }
+                    }
+                }
+                return slot;
+            }
+            catch { return null; }
         }
 
         // 玩家背包变化
@@ -441,54 +542,37 @@ namespace PersistentPotionBuff
             trackedContainers = newContainers;
         }
 
-        private void SubscribeToContainer(Item container)
-        {
-             // 1. 订阅 Item.Inventory 属性
-             if (container.Inventory != null)
-             {
-                 SubscribeToInventory(container.Inventory, container);
-             }
+        // --- 容器管理方法 ---
 
-             // 2. 订阅 GetComponent<Inventory>()
-             Inventory compInv = container.GetComponent<Inventory>();
-             if (compInv != null && compInv != container.Inventory) // 避免重复订阅同一个实例
-             {
-                 SubscribeToInventory(compInv, container);
-             }
+        // 获取物品上的所有 Inventory 对象
+        private IEnumerable<Inventory> GetInventoriesOn(Item item)
+        {
+            if (item == null) yield break;
+            if (item.Inventory != null) yield return item.Inventory;
+            var compInv = item.GetComponent<Inventory>();
+            if (compInv != null && compInv != item.Inventory) yield return compInv;
         }
 
-        private void SubscribeToInventory(Inventory inv, Item container)
+        private void SubscribeToContainer(Item container)
         {
-             if (inv != null && !subscribedInventories.Contains(inv))
-             {
-                 inv.onContentChanged += OnContainerContentChanged;
-                 subscribedInventories.Add(inv);
-             }
+            foreach (var inv in GetInventoriesOn(container))
+            {
+                if (inv != null && subscribedInventories.Add(inv))
+                {
+                    inv.onContentChanged += OnContainerContentChanged;
+                }
+            }
         }
 
         private void UnsubscribeFromContainer(Item container)
         {
-             // 1. 取消订阅 Item.Inventory 属性
-             if (container.Inventory != null)
-             {
-                 UnsubscribeFromInventory(container.Inventory, container);
-             }
-
-             // 2. 取消订阅 GetComponent<Inventory>()
-             Inventory compInv = container.GetComponent<Inventory>();
-             if (compInv != null && compInv != container.Inventory)
-             {
-                 UnsubscribeFromInventory(compInv, container);
-             }
-        }
-
-        private void UnsubscribeFromInventory(Inventory inv, Item container)
-        {
-             if (inv != null && subscribedInventories.Contains(inv))
-             {
-                 inv.onContentChanged -= OnContainerContentChanged;
-                 subscribedInventories.Remove(inv);
-             }
+            foreach (var inv in GetInventoriesOn(container))
+            {
+                if (inv != null && subscribedInventories.Remove(inv))
+                {
+                    inv.onContentChanged -= OnContainerContentChanged;
+                }
+            }
         }
 
         private void UpdateBuffs()
@@ -510,31 +594,38 @@ namespace PersistentPotionBuff
             foreach (var container in trackedContainers)
             {
                 if (container == null) continue;
-                List<Item> containerItems = new List<Item>();
-                if (container.Inventory != null)
+                
+                // 统计 Inventory 中的物品
+                foreach (var inv in GetInventoriesOn(container))
                 {
-                    foreach(var item in container.Inventory)
-                        if(item != null) containerItems.Add(item);
+                    foreach (var item in inv)
+                    {
+                        if (item != null)
+                        {
+                            int count = item.StackCount;
+                            if (itemCounts.ContainsKey(item.TypeID))
+                                itemCounts[item.TypeID] += count;
+                            else
+                                itemCounts[item.TypeID] = count;
+                        }
+                    }
                 }
-                else if (container.Slots != null)
+
+                // 统计 Slots 中的物品
+                if (container.Slots != null)
                 {
                     foreach(var slot in container.Slots)
-                        if(slot != null && slot.Content != null) containerItems.Add(slot.Content);
-                }
-                else
-                {
-                    var invComp = container.GetComponent<Inventory>();
-                    if (invComp != null)
-                        foreach(var item in invComp)
-                            if(item != null) containerItems.Add(item);
-                }
-                foreach (var item in containerItems)
-                {
-                    int count = item.StackCount;
-                    if (itemCounts.ContainsKey(item.TypeID))
-                        itemCounts[item.TypeID] += count;
-                    else
-                        itemCounts[item.TypeID] = count;
+                    {
+                        if(slot != null && slot.Content != null) 
+                        {
+                            var item = slot.Content;
+                            int count = item.StackCount;
+                            if (itemCounts.ContainsKey(item.TypeID))
+                                itemCounts[item.TypeID] += count;
+                            else
+                                itemCounts[item.TypeID] = count;
+                        }
+                    }
                 }
             }
             // 应用或移除Buff
@@ -605,7 +696,7 @@ namespace PersistentPotionBuff
             HashSet<Item> result = new HashSet<Item>();
             int targetContainerID = _settings.targetContainerId;
 
-            // 检查人物背包
+            // 检查玩家背包
             if (CharacterMainControl.Main != null && CharacterMainControl.Main.CharacterItem != null)
             {
                 CollectItemsRecursive(CharacterMainControl.Main.CharacterItem, targetContainerID, result);
@@ -623,7 +714,15 @@ namespace PersistentPotionBuff
                 }
             }
 
-            // 可扩展：其他容器
+            // 检查额外槽位
+            foreach (var kvp in _trackedSlots)
+            {
+                var slot = kvp.Value;
+                if (slot != null && slot.Content != null)
+                {
+                    CollectItemsRecursive(slot.Content, targetContainerID, result);
+                }
+            }
 
             return result;
         }
@@ -638,20 +737,9 @@ namespace PersistentPotionBuff
                 result.Add(currentItem);
             }
 
-            // 检查Item.Inventory属性
-            if (currentItem.Inventory != null)
+            foreach (var inv in GetInventoriesOn(currentItem))
             {
-                foreach (var childItem in currentItem.Inventory)
-                {
-                    CollectItemsRecursive(childItem, targetID, result);
-                }
-            }
-
-            // 检查组件Inventory
-            Inventory compInv = currentItem.GetComponent<Inventory>();
-            if (compInv != null && compInv != currentItem.Inventory)
-            {
-                foreach (var childItem in compInv)
+                foreach (var childItem in inv)
                 {
                     CollectItemsRecursive(childItem, targetID, result);
                 }
@@ -685,4 +773,3 @@ namespace PersistentPotionBuff
         }
     }
 }
-
